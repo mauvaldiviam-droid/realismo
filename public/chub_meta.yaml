@@ -35,6 +35,10 @@ config_schema:
   title: Realismo
   description: Ajustes del stage de realismo.
   properties:
+    npc_independence:
+      type: boolean
+      title: Personajes independientes (deciden antes de actuar)
+      default: true
     track_scene:
       type: boolean
       title: Recordar lugar, hora, ropa y hechos clave
@@ -42,12 +46,11 @@ config_schema:
     show_scene_note:
       type: boolean
       title: Mostrar bajo cada respuesta lo que el stage recuerda
-      default: true
+      default: false
     custom_rules:
       type: string
       title: Reglas extra (en inglés, opcional)
       default: ""
-
 # The schema of the state that you store.
 # This isn't needed even if you do store state,
 #   and is here more for future use cases to

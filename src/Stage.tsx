@@ -3,22 +3,29 @@ import {StageBase, StageResponse, InitialData, Message} from "@chub-ai/stages-ts
 import {LoadResponse} from "@chub-ai/stages-ts/dist/types/load";
 
 /*
- * STAGE DE REALISMO (versión 2)
+ * STAGE DE REALISMO (versión 5)
  *
  * Funciona en segundo plano (usar position: 'NONE').
  *
- * Las pruebas mostraron que `stageDirections` no llega al modelo en este chat,
- * pero `modifiedMessage` sí. Por eso esta versión añade al FINAL de cada mensaje
- * tuyo una nota corta [OOC-realismo: ...] con:
- *   - una línea de reglas de realismo,
- *   - la escena actual (lugar, hora, ropa, hechos clave),
- *   - la petición de EMPEZAR la respuesta con una línea SCENE| ... actualizada.
+ * Añade al FINAL de cada mensaje tuyo una nota [OOC-realismo: ...] (modifiedMessage es
+ * el único camino que llega al modelo en este chat). La nota pide dos cosas:
  *
- * Al recibir la respuesta (afterResponse) el stage lee esa línea, la guarda en el
- * estado del mensaje, la QUITA del texto visible y muestra una línea de control.
- * Si haces swipe o saltas a otro mensaje, setState restaura la escena correcta.
+ *  1) FIDELIDAD DE LOS PERSONAJES. Cada personaje actúa estrictamente según su descripción,
+ *     personalidad, conocimientos, objetivos e historia. Que el jugador lo pida nunca es
+ *     motivo por sí solo: el personaje necesita una razón PROPIA. Antes de escribir, el
+ *     modelo rellena una línea MIND| (qué base de la tarjeta aplica, qué razón propia hay,
+ *     qué postura toma) y la respuesta debe seguirla. Si no hay razón propia, no puede aceptar.
+ *     Las tarjetas ingenuas u obedientes siguen siéndolo: también eso es fidelidad.
+ *
+ *  2) MEMORIA DE ESCENA. Una línea SCENE| con lugar, hora, ropa y hechos clave.
+ *
+ * Al recibir la respuesta (afterResponse) el stage quita ambas líneas del texto visible.
+ * La línea MIND| se muestra en la consola del navegador (F12) para poder revisar por qué
+ * el personaje decidió lo que decidió. Si haces swipe o saltas a otro mensaje, setState
+ * restaura la escena correcta.
  *
  * La nota queda visible y guardada en tus mensajes: es el precio de este camino.
+ * Cada opción se puede apagar desde el formulario del stage (por chat).
  */
 
 type Scene = {
@@ -35,7 +42,8 @@ type ChatStateType = any;
 
 const DEFAULTS = {
     track_scene: true,
-    show_scene_note: true,
+    show_scene_note: false,
+    npc_independence: true,
     custom_rules: "",
 };
 
@@ -43,23 +51,37 @@ const DEFAULTS = {
 const NOTE_START = "[OOC-realismo:";
 const NOTE_RE = /\n*\[OOC-realismo:[\s\S]*\]\s*$/;
 
-const RULES_LINE =
-    "Stay realistic: every character has their own will, limits and knowledge, reacts like a real person and holds their position. " +
-    "Never bend events or a character's mind to give the user what they want without a concrete reason in the story, and keep continuity. " +
-    "Never write the user's actions.";
+const INDEPENDENCE_RULES =
+    "Fidelity check. Every character acts strictly according to their established personality, description, beliefs, knowledge, goals, feelings and history with the user. " +
+    "The user asking for something is never a reason by itself: a character acts only if the request fits who they are and they have a reason of their own (a goal, an emotion, a bond, a need, or real pressure from the situation). " +
+    "If the request contradicts their character, is absurd or self-destructive, or has no reason behind it, they question it, hesitate, set conditions or refuse, as that person really would. " +
+    "Trivial everyday requests that anyone would reasonably grant need no special reason. " +
+    "Characters stay consistent with what they already said and did and with what they can know. If a character is naive, obedient or oblivious by design, that trait is part of who they are and stays. " +
+    "Before writing, fill the MIND line; if own_reason is 'none', the stance cannot be accept. Your reply must follow the stance. " +
+    "Characters also pursue their own goals and propose alternatives, so the story keeps moving. Never write the user's actions.";
+
+const MIND_ASK =
+    "MIND| user_wants: <what the user is trying to do> | card_basis: <the established trait, belief, goal or fact of the character that applies> | own_reason: <the character's own reason to do it, or 'none'> | stance: <accept|accept-with-condition|counter-offer|hesitate|refuse>";
 
 const SCENE_ASK =
-    "Start your reply with ONE line in exactly this format, with the values updated for the current moment, then continue with your normal reply: " +
     "SCENE| place: ... | time: ... | clothing: ... | events: ... (max 8 items separated by '; ')";
 
 const SCENE_EXAMPLE =
-    " Example: SCENE| place: beach near the lighthouse | time: afternoon | clothing: Spinel: oversized boots; user: unknown | events: arrived at the beach; the user proposed exploring a cave";
+    " Example of the SCENE line: SCENE| place: beach near the lighthouse | time: afternoon | clothing: Spinel: oversized boots; user: unknown | events: arrived at the beach; the user proposed exploring a cave";
 
-// Formato principal: una línea "SCENE| place: ... | time: ..." (tolera **SCENE**)
+// Línea de decisión del personaje (se quita del texto visible)
+const MIND_LINE_RE = /^[ \t]*\**MIND\**[ \t]*\|(.*)$/im;
+// Línea de escena (tolera **SCENE**)
 const SCENE_LINE_RE = /^[ \t]*\**SCENE\**[ \t]*\|(.*)$/im;
 // Respaldo: bloque [scene]...[/scene] o <scene>...</scene>
 const SCENE_RE = /(?:<|\[)scene(?:>|\])([\s\S]*?)(?:<|\[)\/scene(?:>|\])/i;
 const SCENE_OPEN_RE = /(?:<|\[)scene(?:>|\])/i;
+
+function stripMind(text: string): {mind: string | null; rest: string} {
+    const m = text.match(MIND_LINE_RE);
+    if (!m) return {mind: null, rest: text};
+    return {mind: m[1].trim(), rest: text.replace(MIND_LINE_RE, "").trim()};
+}
 
 function toScene(fields: Record<string, string>): Scene | null {
     const scene: Scene = {
@@ -73,7 +95,7 @@ function toScene(fields: Record<string, string>): Scene | null {
 }
 
 function parseScene(text: string): {scene: Scene | null; cleaned: string} {
-    // 1) Línea SCENE| ... (la que se pide ahora)
+    // 1) Línea SCENE| ...
     const line = text.match(SCENE_LINE_RE);
     if (line) {
         const lineFields: Record<string, string> = {};
@@ -119,20 +141,35 @@ function sceneNote(s: Scene): string {
     return parts.join(" | ");
 }
 
+// Devuelve "" si no hay nada que pedir (todo apagado)
 function buildNote(cfg: typeof DEFAULTS, scene: Scene | null): string {
-    const bits: string[] = [RULES_LINE];
+    const bits: string[] = [];
+
+    if (cfg.npc_independence) bits.push(INDEPENDENCE_RULES);
+
     const extra = (cfg.custom_rules ?? "").trim();
     if (extra) bits.push(extra);
-    if (cfg.track_scene) {
-        if (scene) {
-            bits.push(
-                `Current scene: SCENE| place: ${scene.place} | time: ${scene.time} | clothing: ${scene.clothing} | events: ${scene.events}`
-            );
-            bits.push(SCENE_ASK);
-        } else {
-            bits.push(SCENE_ASK + SCENE_EXAMPLE);
-        }
+
+    if (cfg.track_scene && scene) {
+        bits.push(
+            `Current scene: SCENE| place: ${scene.place} | time: ${scene.time} | clothing: ${scene.clothing} | events: ${scene.events}`
+        );
     }
+
+    const lines: string[] = [];
+    if (cfg.npc_independence) lines.push(MIND_ASK);
+    if (cfg.track_scene) lines.push(SCENE_ASK);
+
+    if (lines.length > 0) {
+        const count = lines.length === 1 ? "ONE line" : "TWO lines";
+        bits.push(
+            `Start your reply with ${count} in exactly this format, with the values filled in for the current moment, each on its own line, then continue with your normal reply: ` +
+            lines.join(" then, on the next line, ")
+        );
+        if (cfg.track_scene && !scene) bits.push(SCENE_EXAMPLE.trim());
+    }
+
+    if (bits.length === 0) return "";
     return `${NOTE_START} ${bits.join(" ")}]`;
 }
 
@@ -146,6 +183,7 @@ export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateT
         this.cfg = {
             track_scene: c.track_scene ?? DEFAULTS.track_scene,
             show_scene_note: c.show_scene_note ?? DEFAULTS.show_scene_note,
+            npc_independence: c.npc_independence ?? DEFAULTS.npc_independence,
             custom_rules: c.custom_rules ?? DEFAULTS.custom_rules,
         };
         this.scene = (data.messageState as any)?.scene ?? null;
@@ -166,31 +204,40 @@ export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateT
 
         // Se quita una nota anterior (por ejemplo al regenerar) y se añade la nueva
         const base = userMessage.content.replace(NOTE_RE, "").trimEnd();
+        const note = buildNote(this.cfg, this.scene);
 
         return {
-            modifiedMessage: `${base}\n\n${buildNote(this.cfg, this.scene)}`,
+            modifiedMessage: note ? `${base}\n\n${note}` : base,
             messageState: {scene: this.scene},
         };
     }
 
     async afterResponse(botMessage: Message): Promise<Partial<StageResponse<ChatStateType, MessageStateType>>> {
-        console.log("realismo: afterResponse, final de la respuesta:", botMessage.content.slice(-300));
-        if (!this.cfg.track_scene) return {};
+        console.log("realismo: afterResponse, inicio de la respuesta:", botMessage.content.slice(0, 400));
 
-        const {scene, cleaned} = parseScene(botMessage.content);
-        if (scene) this.scene = mergeScene(this.scene, scene);
+        // 1) Línea de decisión del personaje: se muestra en consola y se quita del texto
+        const {mind, rest} = stripMind(botMessage.content);
+        if (mind) console.log("realismo: decisión del personaje ->", mind);
 
-       /* let note: string | null = null;
-        if (this.cfg.show_scene_note) {
+        // 2) Línea de escena
+        let cleaned = rest;
+        if (this.cfg.track_scene) {
+            const parsed = parseScene(rest);
+            cleaned = parsed.cleaned;
+            if (parsed.scene) this.scene = mergeScene(this.scene, parsed.scene);
+        }
+
+      /*  let note: string | null = null;
+        if (this.cfg.track_scene && this.cfg.show_scene_note) {
             note = this.scene
                 ? sceneNote(this.scene)
-                : "Realismo activo (el modelo aún no envió el bloque de escena)";
-        }*/
+                : "Realismo activo (el modelo aún no envió la línea de escena)";
+        } */
 
         return {
             modifiedMessage: cleaned !== botMessage.content ? cleaned : null,
             messageState: {scene: this.scene},
-            /*systemMessage: note,*/
+         /*   systemMessage: note,*/
         };
     }
 
