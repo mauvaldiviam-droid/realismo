@@ -180,17 +180,17 @@ export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateT
         const {scene, cleaned} = parseScene(botMessage.content);
         if (scene) this.scene = mergeScene(this.scene, scene);
 
-        let note: string | null = null;
+       /* let note: string | null = null;
         if (this.cfg.show_scene_note) {
             note = this.scene
                 ? sceneNote(this.scene)
                 : "Realismo activo (el modelo aún no envió el bloque de escena)";
-        }
+        }*/
 
         return {
             modifiedMessage: cleaned !== botMessage.content ? cleaned : null,
             messageState: {scene: this.scene},
-            systemMessage: note,
+            /*systemMessage: note,*/
         };
     }
 
