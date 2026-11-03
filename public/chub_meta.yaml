@@ -2,7 +2,7 @@
 #   in which case these values can be managed in the UI.
 
 # The name of the stage.
-# project_name: "Stage Template"
+project_name: "Realismo"
 
 # A short tagline to show in search.
 # tagline: "A base template for all stages."
@@ -18,7 +18,7 @@
 #   but leave the text input box.
 # 'FULLSCREEN' will make nothing below the header bar
 #   show except for your stage.
-# position: 'ADJACENT'
+position: 'NONE'
 
 # Self-explanatory.
 # tags:
@@ -32,10 +32,21 @@
 #   defined schema, it won't work.
 config_schema:
   type: object
+  title: Realismo
+  description: Ajustes del stage de realismo.
   properties:
-    health:
-      type: integer
-      default: 100
+    track_scene:
+      type: boolean
+      title: Recordar lugar, hora, ropa y hechos clave
+      default: true
+    show_scene_note:
+      type: boolean
+      title: Mostrar bajo cada respuesta lo que el stage recuerda
+      default: true
+    custom_rules:
+      type: string
+      title: Reglas extra (en inglés, opcional)
+      default: ""
 
 # The schema of the state that you store.
 # This isn't needed even if you do store state,

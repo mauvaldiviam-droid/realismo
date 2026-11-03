@@ -2,204 +2,200 @@ import {ReactElement} from "react";
 import {StageBase, StageResponse, InitialData, Message} from "@chub-ai/stages-ts";
 import {LoadResponse} from "@chub-ai/stages-ts/dist/types/load";
 
-/***
- The type that this stage persists message-level state in.
- This is primarily for readability, and not enforced.
+/*
+ * STAGE DE REALISMO (versión 2)
+ *
+ * Funciona en segundo plano (usar position: 'NONE').
+ *
+ * Las pruebas mostraron que `stageDirections` no llega al modelo en este chat,
+ * pero `modifiedMessage` sí. Por eso esta versión añade al FINAL de cada mensaje
+ * tuyo una nota corta [OOC-realismo: ...] con:
+ *   - una línea de reglas de realismo,
+ *   - la escena actual (lugar, hora, ropa, hechos clave),
+ *   - la petición de EMPEZAR la respuesta con una línea SCENE| ... actualizada.
+ *
+ * Al recibir la respuesta (afterResponse) el stage lee esa línea, la guarda en el
+ * estado del mensaje, la QUITA del texto visible y muestra una línea de control.
+ * Si haces swipe o saltas a otro mensaje, setState restaura la escena correcta.
+ *
+ * La nota queda visible y guardada en tus mensajes: es el precio de este camino.
+ */
 
- @description This type is saved in the database after each message,
-  which makes it ideal for storing things like positions and statuses,
-  but not for things like history, which is best managed ephemerally
-  in the internal state of the Stage class itself.
- ***/
-type MessageStateType = any;
+type Scene = {
+    place: string;
+    time: string;
+    clothing: string;
+    events: string;
+};
 
-/***
- The type of the stage-specific configuration of this stage.
-
- @description This is for things you want people to be able to configure,
-  like background color.
- ***/
+type MessageStateType = {scene: Scene | null};
 type ConfigType = any;
-
-/***
- The type that this stage persists chat initialization state in.
- If there is any 'constant once initialized' static state unique to a chat,
- like procedurally generated terrain that is only created ONCE and ONLY ONCE per chat,
- it belongs here.
- ***/
 type InitStateType = any;
-
-/***
- The type that this stage persists dynamic chat-level state in.
- This is for any state information unique to a chat,
-    that applies to ALL branches and paths such as clearing fog-of-war.
- It is usually unlikely you will need this, and if it is used for message-level
-    data like player health then it will enter an inconsistent state whenever
-    they change branches or jump nodes. Use MessageStateType for that.
- ***/
 type ChatStateType = any;
 
-/***
- A simple example class that implements the interfaces necessary for a Stage.
- If you want to rename it, be sure to modify App.js as well.
- @link https://github.com/CharHubAI/chub-stages-ts/blob/main/src/types/stage.ts
- ***/
-export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateType, ConfigType> {
+const DEFAULTS = {
+    track_scene: true,
+    show_scene_note: true,
+    custom_rules: "",
+};
 
-    /***
-     A very simple example internal state. Can be anything.
-     This is ephemeral in the sense that it isn't persisted to a database,
-     but exists as long as the instance does, i.e., the chat page is open.
-     ***/
-    myInternalState: {[key: string]: any};
+// Marca única: permite reconocer y reemplazar la nota (evita duplicarla al regenerar)
+const NOTE_START = "[OOC-realismo:";
+const NOTE_RE = /\n*\[OOC-realismo:[\s\S]*\]\s*$/;
+
+const RULES_LINE =
+    "Stay realistic: every character has their own will, limits and knowledge, reacts like a real person and holds their position. " +
+    "Never bend events or a character's mind to give the user what they want without a concrete reason in the story, and keep continuity. " +
+    "Never write the user's actions.";
+
+const SCENE_ASK =
+    "Start your reply with ONE line in exactly this format, with the values updated for the current moment, then continue with your normal reply: " +
+    "SCENE| place: ... | time: ... | clothing: ... | events: ... (max 8 items separated by '; ')";
+
+const SCENE_EXAMPLE =
+    " Example: SCENE| place: beach near the lighthouse | time: afternoon | clothing: Spinel: oversized boots; user: unknown | events: arrived at the beach; the user proposed exploring a cave";
+
+// Formato principal: una línea "SCENE| place: ... | time: ..." (tolera **SCENE**)
+const SCENE_LINE_RE = /^[ \t]*\**SCENE\**[ \t]*\|(.*)$/im;
+// Respaldo: bloque [scene]...[/scene] o <scene>...</scene>
+const SCENE_RE = /(?:<|\[)scene(?:>|\])([\s\S]*?)(?:<|\[)\/scene(?:>|\])/i;
+const SCENE_OPEN_RE = /(?:<|\[)scene(?:>|\])/i;
+
+function toScene(fields: Record<string, string>): Scene | null {
+    const scene: Scene = {
+        place: fields["place"] ?? "",
+        time: fields["time"] ?? "",
+        clothing: fields["clothing"] ?? "",
+        events: fields["events"] ?? "",
+    };
+    const empty = !scene.place && !scene.time && !scene.clothing && !scene.events;
+    return empty ? null : scene;
+}
+
+function parseScene(text: string): {scene: Scene | null; cleaned: string} {
+    // 1) Línea SCENE| ... (la que se pide ahora)
+    const line = text.match(SCENE_LINE_RE);
+    if (line) {
+        const lineFields: Record<string, string> = {};
+        for (const part of line[1].split("|")) {
+            const i = part.indexOf(":");
+            if (i > 0) lineFields[part.slice(0, i).trim().toLowerCase()] = part.slice(i + 1).trim();
+        }
+        return {scene: toScene(lineFields), cleaned: text.replace(SCENE_LINE_RE, "").trim()};
+    }
+
+    // 2) Respaldo: bloque [scene]...[/scene]
+    const m = text.match(SCENE_RE);
+    if (!m) {
+        // Bloque abierto pero sin cerrar (respuesta cortada): se quita igual
+        const open = text.search(SCENE_OPEN_RE);
+        if (open >= 0) return {scene: null, cleaned: text.slice(0, open).trimEnd()};
+        return {scene: null, cleaned: text};
+    }
+    const fields: Record<string, string> = {};
+    for (const l of m[1].split(/\r?\n/)) {
+        const i = l.indexOf(":");
+        if (i > 0) fields[l.slice(0, i).trim().toLowerCase()] = l.slice(i + 1).trim();
+    }
+    return {scene: toScene(fields), cleaned: text.replace(SCENE_RE, "").trimEnd()};
+}
+
+// Si el modelo deja un campo vacío, se conserva el valor anterior
+function mergeScene(prev: Scene | null, next: Scene): Scene {
+    return {
+        place: next.place || prev?.place || "",
+        time: next.time || prev?.time || "",
+        clothing: next.clothing || prev?.clothing || "",
+        events: next.events || prev?.events || "",
+    };
+}
+
+function sceneNote(s: Scene): string {
+    const parts = [
+        s.place && `Lugar: ${s.place}`,
+        s.time && `Hora: ${s.time}`,
+        s.clothing && `Ropa: ${s.clothing}`,
+    ].filter(Boolean);
+    return parts.join(" | ");
+}
+
+function buildNote(cfg: typeof DEFAULTS, scene: Scene | null): string {
+    const bits: string[] = [RULES_LINE];
+    const extra = (cfg.custom_rules ?? "").trim();
+    if (extra) bits.push(extra);
+    if (cfg.track_scene) {
+        if (scene) {
+            bits.push(
+                `Current scene: SCENE| place: ${scene.place} | time: ${scene.time} | clothing: ${scene.clothing} | events: ${scene.events}`
+            );
+            bits.push(SCENE_ASK);
+        } else {
+            bits.push(SCENE_ASK + SCENE_EXAMPLE);
+        }
+    }
+    return `${NOTE_START} ${bits.join(" ")}]`;
+}
+
+export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateType, ConfigType> {
+    scene: Scene | null = null;
+    cfg = {...DEFAULTS};
 
     constructor(data: InitialData<InitStateType, ChatStateType, MessageStateType, ConfigType>) {
-        /***
-         This is the first thing called in the stage,
-         to create an instance of it.
-         The definition of InitialData is at @link https://github.com/CharHubAI/chub-stages-ts/blob/main/src/types/initial.ts
-         Character at @link https://github.com/CharHubAI/chub-stages-ts/blob/main/src/types/character.ts
-         User at @link https://github.com/CharHubAI/chub-stages-ts/blob/main/src/types/user.ts
-         ***/
         super(data);
-        const {
-            characters,         // @type:  { [key: string]: Character }
-            users,                  // @type:  { [key: string]: User}
-            config,                                 //  @type:  ConfigType
-            messageState,                           //  @type:  MessageStateType
-            environment,                     // @type: Environment (which is a string)
-            initState,                             // @type: null | InitStateType
-            chatState                              // @type: null | ChatStateType
-        } = data;
-        this.myInternalState = messageState != null ? messageState : {'someKey': 'someValue'};
-        this.myInternalState['numUsers'] = Object.keys(users).length;
-        this.myInternalState['numChars'] = Object.keys(characters).length;
+        const c: any = data.config ?? {};
+        this.cfg = {
+            track_scene: c.track_scene ?? DEFAULTS.track_scene,
+            show_scene_note: c.show_scene_note ?? DEFAULTS.show_scene_note,
+            custom_rules: c.custom_rules ?? DEFAULTS.custom_rules,
+        };
+        this.scene = (data.messageState as any)?.scene ?? null;
+        console.log("realismo: stage cargado", data.config);
     }
 
     async load(): Promise<Partial<LoadResponse<InitStateType, ChatStateType, MessageStateType>>> {
-        /***
-         This is called immediately after the constructor, in case there is some asynchronous code you need to
-         run on instantiation.
-         ***/
-        return {
-            /*** @type boolean @default null
-             @description The 'success' boolean returned should be false IFF (if and only if), some condition is met that means
-              the stage shouldn't be run at all and the iFrame can be closed/removed.
-              For example, if a stage displays expressions and no characters have an expression pack,
-              there is no reason to run the stage, so it would return false here. ***/
-            success: true,
-            /*** @type null | string @description an error message to show
-             briefly at the top of the screen, if any. ***/
-            error: null,
-            initState: null,
-            chatState: null,
-        };
+        return {success: true, error: null};
     }
 
+    // Swipe o salto a otro mensaje: se restaura la escena que tenía ese mensaje
     async setState(state: MessageStateType): Promise<void> {
-        /***
-         This can be called at any time, typically after a jump to a different place in the chat tree
-         or a swipe. Note how neither InitState nor ChatState are given here. They are not for
-         state that is affected by swiping.
-         ***/
-        if (state != null) {
-            this.myInternalState = {...this.myInternalState, ...state};
-        }
+        this.scene = state?.scene ?? null;
     }
 
     async beforePrompt(userMessage: Message): Promise<Partial<StageResponse<ChatStateType, MessageStateType>>> {
-        /***
-         This is called after someone presses 'send', but before anything is sent to the LLM.
-         ***/
-        const {
-            content,            /*** @type: string
-             @description Just the last message about to be sent. ***/
-            anonymizedId,       /*** @type: string
-             @description An anonymized ID that is unique to this individual
-              in this chat, but NOT their Chub ID. ***/
-            isBot             /*** @type: boolean
-             @description Whether this is itself from another bot, ex. in a group chat. ***/
-        } = userMessage;
+        console.log("realismo: beforePrompt, escena actual:", this.scene);
+
+        // Se quita una nota anterior (por ejemplo al regenerar) y se añade la nueva
+        const base = userMessage.content.replace(NOTE_RE, "").trimEnd();
+
         return {
-            /*** @type null | string @description A string to add to the
-             end of the final prompt sent to the LLM,
-             but that isn't persisted. ***/
-            stageDirections: null,
-            /*** @type MessageStateType | null @description the new state after the userMessage. ***/
-            messageState: {'someKey': this.myInternalState['someKey']},
-            /*** @type null | string @description If not null, the user's message itself is replaced
-             with this value, both in what's sent to the LLM and in the database. ***/
-            modifiedMessage: null,
-            /*** @type null | string @description A system message to append to the end of this message.
-             This is unique in that it shows up in the chat log and is sent to the LLM in subsequent messages,
-             but it's shown as coming from a system user and not any member of the chat. If you have things like
-             computed stat blocks that you want to show in the log, but don't want the LLM to start trying to
-             mimic/output them, they belong here. ***/
-            systemMessage: null,
-            /*** @type null | string @description an error message to show
-             briefly at the top of the screen, if any. ***/
-            error: null,
-            chatState: null,
+            modifiedMessage: `${base}\n\n${buildNote(this.cfg, this.scene)}`,
+            messageState: {scene: this.scene},
         };
     }
 
     async afterResponse(botMessage: Message): Promise<Partial<StageResponse<ChatStateType, MessageStateType>>> {
-        /***
-         This is called immediately after a response from the LLM.
-         ***/
-        const {
-            content,            /*** @type: string
-             @description The LLM's response. ***/
-            anonymizedId,       /*** @type: string
-             @description An anonymized ID that is unique to this individual
-              in this chat, but NOT their Chub ID. ***/
-            isBot             /*** @type: boolean
-             @description Whether this is from a bot, conceivably always true. ***/
-        } = botMessage;
+        console.log("realismo: afterResponse, final de la respuesta:", botMessage.content.slice(-300));
+        if (!this.cfg.track_scene) return {};
+
+        const {scene, cleaned} = parseScene(botMessage.content);
+        if (scene) this.scene = mergeScene(this.scene, scene);
+
+        let note: string | null = null;
+        if (this.cfg.show_scene_note) {
+            note = this.scene
+                ? sceneNote(this.scene)
+                : "Realismo activo (el modelo aún no envió el bloque de escena)";
+        }
+
         return {
-            /*** @type null | string @description A string to add to the
-             end of the final prompt sent to the LLM,
-             but that isn't persisted. ***/
-            stageDirections: null,
-            /*** @type MessageStateType | null @description the new state after the botMessage. ***/
-            messageState: {'someKey': this.myInternalState['someKey']},
-            /*** @type null | string @description If not null, the bot's response itself is replaced
-             with this value, both in what's sent to the LLM subsequently and in the database. ***/
-            modifiedMessage: null,
-            /*** @type null | string @description an error message to show
-             briefly at the top of the screen, if any. ***/
-            error: null,
-            systemMessage: null,
-            chatState: null
+            modifiedMessage: cleaned !== botMessage.content ? cleaned : null,
+            messageState: {scene: this.scene},
+            systemMessage: note,
         };
     }
 
-
+    // Con position: 'NONE' esto no se muestra; el stage trabaja en segundo plano
     render(): ReactElement {
-        /***
-         There should be no "work" done here. Just returning the React element to display.
-         If you're unfamiliar with React and prefer video, I've heard good things about
-         @link https://scrimba.com/learn/learnreact but haven't personally watched/used it.
-
-         For creating 3D and game components, react-three-fiber
-           @link https://docs.pmnd.rs/react-three-fiber/getting-started/introduction
-           and the associated ecosystem of libraries are quite good and intuitive.
-
-         Cuberun is a good example of a game built with them.
-           @link https://github.com/akarlsten/cuberun (Source)
-           @link https://cuberun.adamkarlsten.com/ (Demo)
-         ***/
-        return <div style={{
-            width: '100vw',
-            height: '100vh',
-            display: 'grid',
-            alignItems: 'stretch'
-        }}>
-            <div>Hello World! I'm an empty stage! With {this.myInternalState['someKey']}!</div>
-            <div>There is/are/were {this.myInternalState['numChars']} character(s)
-                and {this.myInternalState['numUsers']} human(s) here.
-            </div>
-        </div>;
+        return <div style={{display: "none"}} />;
     }
-
 }
